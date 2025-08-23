@@ -10,5 +10,3 @@ cmake ..
 make -j
 
 echo "✅ Compilación completada."
-
-./screensaver --width 800 --height 600
