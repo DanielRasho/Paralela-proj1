@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
 
     // Instantiation of the renderer, controller that let us interact with sdl window.
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, 
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_SOFTWARE );
 
     if (!renderer) {
         std::cerr << "[Error] SDL_CreateRenderer: " << SDL_GetError() << std::endl;
@@ -246,6 +246,118 @@ int main(int argc, char** argv) {
         
         ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
         ImGui_ImplSDLRenderer2_Init(renderer);
+    }
+    
+    // Performance tracking
+    auto lastTime = std::chrono::high_resolution_clock::now();
+    // auto lastFlockingTime = std::chrono::microseconds(0);
+    auto lastUpdateTime = std::chrono::microseconds(0);
+    auto lastRenderTime = std::chrono::microseconds(0);
+    
+    float fps = 0.0f;
+    int frameCount = 0;
+    auto lastStatsTime = lastTime;
+
+    bool running = true;
+    bool showDetailedStats = false;
+    bool paused = false;
+    
+    // RENDER LOOP
+    while (running) {
+
+        auto frameStartTime = std::chrono::high_resolution_clock::now();
+
+        // If there are unprocessed events, procces one at a time.
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+
+            // if show stats == true, render im gui stats window
+            if (opt.showStats) {
+                ImGui_ImplSDL2_ProcessEvent(&event);
+            }
+            
+            if (event.type == SDL_QUIT){
+                running = false;
+            }
+            
+            else if (event.type == SDL_KEYDOWN) {
+                
+                switch (event.key.keysym.sym) {
+                    case SDLK_ESCAPE:
+                        running = false;
+                        break;
+                }
+            }
+
+            // Add boid at mouse position
+            else if (event.type == SDL_MOUSEBUTTONDOWN) {
+            }
+
+            // Handle window events gracefully
+            else if (event.type == SDL_WINDOWEVENT) {
+                if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
+                    opt.width = event.window.data1;
+                    opt.height = event.window.data2;
+                }
+            }
+        }
+
+        // Render with timing
+        auto renderStart = std::chrono::high_resolution_clock::now();
+    
+        SDL_SetRenderDrawColor(renderer, 20, 25, 40, 255);
+        SDL_RenderClear(renderer);
+
+        // Render ImGui overlay
+        if (opt.showStats) {
+            ImGui_ImplSDLRenderer2_NewFrame();
+            ImGui_ImplSDL2_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::SetNextWindowPos(ImVec2(10, 10));
+            ImGui::SetNextWindowBgAlpha(0.8f);
+            ImGui::Begin("Flocking", nullptr, 
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+            ImGui::Text("Boids: %zu | FPS: %.0f | %s", 
+                       0, fps, 
+                       opt.useParallel ? "PAR" : "SER");
+            ImGui::Text("SPACE: pause | P: mode | T: trails | F1: stats");
+            if (paused) ImGui::TextColored(ImVec4(1,1,0,1), "PAUSED");
+            ImGui::End();
+
+            ImGui::Render();
+            // Flush im gui data to framebuffer.
+            ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+        }
+
+        SDL_RenderPresent(renderer);
+        
+        auto renderEnd = std::chrono::high_resolution_clock::now();
+        lastRenderTime = std::chrono::duration_cast<std::chrono::microseconds>(renderEnd - renderStart);
+
+        // Calculate FPS
+        frameCount++;
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto statsElapsed = std::chrono::duration<float>(currentTime - lastStatsTime).count();
+
+        if (statsElapsed >= 1.0f) {
+            fps = frameCount / statsElapsed;
+            frameCount = 0;
+            lastStatsTime = currentTime;
+            
+            // if (!opt.showStats) {
+            //     std::cout << "\rBoids: " << flock.getBoidCount() 
+            //              << " | FPS: " << static_cast<int>(fps)
+            //              << " | Flocking: " << lastFlockingTime.count() << "μs"
+            //              << " | " << (opt.useParallel ? "PAR" : "SER")
+            //              << " | " << (paused ? "PAUSED" : "Running")
+            //              << std::flush;
+            // }
+        }
+        
+        lastTime = frameStartTime;
+
     }
 
     // Resources cleanup
