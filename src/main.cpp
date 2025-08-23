@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <memory>
 #include <algorithm>
+#include <vector>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -65,12 +66,22 @@ struct Vector2D {
         return Vector2D(x - other.x, y - other.y);
     }
 
-    Vector2D operator*(const Vector2D & other) const {
-        return Vector2D(x * other.x, y * other.y);
+    Vector2D operator*(float scalar) const {
+        return Vector2D(x * scalar, y * scalar);
     }
 
-    Vector2D operator/(const Vector2D & other) const {
-        return Vector2D(x / other.x, y / other.y);
+    Vector2D operator/(float scalar) const {
+        return Vector2D(x / scalar, y / scalar);
+    }
+
+    void operator+=(const Vector2D& other) {
+        x += other.x;
+        y += other.y;
+    }
+    
+    void operator-=(const Vector2D& other) {
+        x -= other.x;
+        y -= other.y;
     }
 
     void operator*=(float scalar) {
@@ -191,6 +202,377 @@ static int askInt(const std::string& prompt, int minVal, int fallback) {
 // FLOCK SYSTEM
 // ==========================
 
+class Bird {
+
+public:
+    Vector2D position;
+    Vector2D velocity;
+    Vector2D acceleration;
+    
+    float r;            // Size
+    float maxSpeed;     // Maximum speed
+    float maxForce;     // Maximum steering force
+    
+    // Flocking parameters
+    float separationRadius;
+    float alignmentRadius;
+    float cohesionRadius;
+    
+    // Visual properties
+    Uint8 red, green, blue, alpha;
+
+public:
+        Bird(float x, float y) {
+            position = Vector2D(x, y);
+            
+            // Random initial velocity
+            float angle = static_cast<float>(rand()) / RAND_MAX * TWO_PI;
+            velocity = Vector2D::fromAngle(angle) * 2.0f;
+
+            acceleration = Vector2D(0, 0);
+            
+            r = 3.0f;
+            maxSpeed = 2.0f;
+            maxForce = 0.03f;
+
+            // Flock parameter initalization
+            // Same for all birds
+            separationRadius = 25.0f;
+            alignmentRadius = 50.0f;
+            cohesionRadius = 50.0f;
+            
+            // Random color with bird-like hues
+            red = 150 + rand() % 105;    // 150-255
+            green = 100 + rand() % 100;  // 100-200
+            blue = 50 + rand() % 100;    // 50-150
+            alpha = 255;
+        }
+
+        // Sets the Bird new position based on current accelaration, velocity and current coordinates.
+        void update() {
+            // Update velocity
+            velocity += acceleration;
+            velocity.limit(maxSpeed);
+            position += velocity;
+            
+            // Reset acceleration
+            acceleration *= 0;
+        }
+
+        // Update Bird current fields based on flock model ecuations.
+        void flock(const std::vector<Bird>& birds, int windowWidth, int windowHeight) {
+            Vector2D sep = separate(birds);
+            Vector2D ali = align(birds);
+            Vector2D coh = cohesion(birds);
+            Vector2D bias = environmentalBias(windowWidth, windowHeight);
+            
+            // Weight the forces
+            sep *= 1.5f;   // Avoid collisions (highest priority)
+            ali *= 1.0f;   // Match neighbors
+            coh *= 1.0f;   // Stay together
+            bias *= 0.8f;  // Environmental preference
+            
+            // Apply forces
+            applyForce(sep);
+            applyForce(ali);
+            applyForce(coh);
+            applyForce(bias);
+        }
+
+        void applyForce(const Vector2D& force) {
+            acceleration += force;
+        }
+
+        // A method that calculates and applies a steering force towards a target
+        // STEER = DESIRED MINUS VELOCITY
+        Vector2D seek(const Vector2D& target) {
+            Vector2D desired = target - position;
+            desired.normalize();
+            desired *= maxSpeed;
+            
+            Vector2D steer = desired - velocity;
+            steer.limit(maxForce);
+            return steer;
+        }
+
+
+        // A given unit attempts to move away from neighbors who are too close.
+        Vector2D separate(const std::vector<Bird>& birds) {
+            Vector2D steer(0, 0);
+            int count = 0;
+            
+            for (const auto& other : birds) {
+                float d = Vector2D::distance(position, other.position);
+                if (d > 0 && d < separationRadius) {
+                    Vector2D diff = position - other.position;
+                    diff.normalize();
+                    diff /= d; // Weight by distance
+                    steer += diff;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                steer /= static_cast<float>(count);
+                
+                if (steer.magnitude() > 0) {
+                    steer.normalize();
+                    steer *= maxSpeed;
+                    steer -= velocity;
+                    steer.limit(maxForce);
+                }
+            }
+            
+            return steer;
+        }
+
+        // A given unit attempts to move to the center of mass of its neighbors.
+        Vector2D cohesion(const std::vector<Bird>& birds) {
+            Vector2D sum(0, 0);
+            int count = 0;
+            
+            for (const auto& other : birds) {
+                float d = Vector2D::distance(position, other.position);
+                if (d > 0 && d < cohesionRadius) {
+                    sum += other.position;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                sum /= static_cast<float>(count);
+                return seek(sum);
+            }
+            
+            return Vector2D(0, 0);
+        }
+    
+
+        // A given unit attempts to face the same direction as its neighbors.
+        Vector2D align(const std::vector<Bird>& birds) {
+            Vector2D sum(0, 0);
+            int count = 0;
+            
+            for (const auto& other : birds) {
+                float d = Vector2D::distance(position, other.position);
+                if (d > 0 && d < alignmentRadius) {
+                    sum += other.velocity;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                sum /= static_cast<float>(count);
+                sum.normalize();
+                sum *= maxSpeed;
+                
+                Vector2D steer = sum - velocity;
+                steer.limit(maxForce);
+                return steer;
+            }
+            
+            return Vector2D(0, 0);
+        }
+
+        // Environmental bias - encourages rightward flight in upper half
+        Vector2D environmentalBias(int windowWidth, int windowHeight) {
+            Vector2D bias(0, 0);
+            
+            // Encourage rightward movement (like migrating birds)
+            bias.x = 0.5f;
+            
+            // Encourage staying in upper half of screen
+            float upperHalf = windowHeight * 0.3f;
+            if (position.y > upperHalf) {
+                // If in lower half, add upward bias
+                float distanceFromTop = (position.y - upperHalf) / upperHalf;
+                bias.y = -distanceFromTop * 0.8f;  // Stronger bias the lower you are
+            } else {
+                // If in upper half, slight downward bias to prevent clustering at top
+                bias.y = 0.15f;
+            }
+            
+            // Scale bias based on distance from ideal "flight corridor"
+            float idealY = windowHeight * 0.2f;  // Prefer flying at 30% from top
+            float distanceFromIdeal = abs(position.y - idealY) / (windowHeight * 0.5f);
+            
+            Vector2D steer = bias;
+            steer.normalize();
+            steer *= maxSpeed * (0.3f + distanceFromIdeal * 0.5f);  // Stronger when far from ideal
+            steer -= velocity;
+            steer.limit(maxForce * 0.5f);  // Gentler than other forces
+            
+            return steer;
+        }
+
+        // Behaviour when birds touch the borders: just draw on the opposite section of the window.
+        void borders(int width, int height) {
+            if (position.x < -r) position.x = width + r;
+            if (position.y < -r) position.y = height + r;
+            if (position.x > width + r) position.x = -r;
+            if (position.y > height + r) position.y = -r;
+        }
+
+        // Draws the birds onto window , based on current fields.
+        void render(SDL_Renderer* renderer) const {
+            // Draw boid as triangle pointing in direction of velocity
+            float theta = velocity.heading() + PI / 2;
+            
+            Vector2D v1(0, -r * 2);
+            Vector2D v2(-r, r * 2);
+            Vector2D v3(r, r * 2);
+            
+            // Rotate vertices
+            float cosTheta = cos(theta);
+            float sinTheta = sin(theta);
+            
+            auto rotate = [cosTheta, sinTheta](Vector2D& v) {
+                float newX = v.x * cosTheta - v.y * sinTheta;
+                float newY = v.x * sinTheta + v.y * cosTheta;
+                v.x = newX;
+                v.y = newY;
+            };
+            
+            rotate(v1);
+            rotate(v2);
+            rotate(v3);
+            
+            // Translate to position
+            v1 += position;
+            v2 += position;
+            v3 += position;
+            
+            // Draw filled triangle (approximate with lines)
+            SDL_SetRenderDrawColor(renderer, red, green, blue, alpha);
+            
+            // Draw triangle outline
+            SDL_RenderDrawLine(renderer, static_cast<int>(v1.x), static_cast<int>(v1.y),
+                              static_cast<int>(v2.x), static_cast<int>(v2.y));
+            SDL_RenderDrawLine(renderer, static_cast<int>(v2.x), static_cast<int>(v2.y),
+                              static_cast<int>(v3.x), static_cast<int>(v3.y));
+            SDL_RenderDrawLine(renderer, static_cast<int>(v3.x), static_cast<int>(v3.y),
+                              static_cast<int>(v1.x), static_cast<int>(v1.y));
+            
+            // Fill triangle with additional lines
+            for (int i = 1; i <= 3; i++) {
+                Vector2D p1 = v1 + (v2 - v1) * (i / 4.0f);
+                Vector2D p2 = v1 + (v3 - v1) * (i / 4.0f);
+                SDL_RenderDrawLine(renderer, static_cast<int>(p1.x), static_cast<int>(p1.y),
+                                  static_cast<int>(p2.x), static_cast<int>(p2.y));
+            }
+        }
+};
+
+// Entity responsable for managing a group of birds
+class FlockingSystem {
+private:
+    std::vector<Bird> birds;
+    int windowWidth, windowHeight;
+    
+public:
+    FlockingSystem(int width, int height) : windowWidth(width), windowHeight(height) {}
+    
+    void addBoid(float x, float y) {
+        birds.emplace_back(x, y);
+    }
+    
+    void initializeBirds(int numBirds) {
+        birds.clear();
+        birds.reserve(numBirds);
+        
+        for (int i = 0; i < numBirds; i++) {
+            float x = static_cast<float>(rand()) / RAND_MAX * windowWidth;
+            float y = static_cast<float>(rand()) / RAND_MAX * windowHeight;
+            addBoid(x, y);
+        }
+    }
+    
+    // Serial version - each boid processes neighbors sequentially
+    void updateSerial() {
+        for (auto& bird : birds) {
+            bird.flock(birds, windowWidth, windowHeight);
+        }
+        
+        for (auto& boid : birds) {
+            boid.update();
+            boid.borders(windowWidth, windowHeight);
+        }
+    }
+    
+    // Serial version - each boid processes neighbors 
+    void updateParallel() {
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < birds.size(); i++) {
+            birds[i].flock(birds, windowWidth, windowHeight);
+        }
+        
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < birds.size(); i++) {
+            birds[i].update();
+            birds[i].borders(windowWidth, windowHeight);
+        }
+    }
+    
+    void render(SDL_Renderer* renderer) {
+        for (const auto& bird : birds) {
+            bird.render(renderer);
+        }
+    }
+    
+    // handle window resize
+    void resize(int width, int height) {
+        windowWidth = width;
+        windowHeight = height;
+    }
+    
+    size_t getBoidCount() const { return birds.size(); }
+    
+    void addBoids(int count) {
+        for (int i = 0; i < count; i++) {
+            float x = static_cast<float>(rand()) / RAND_MAX * windowWidth;
+            float y = static_cast<float>(rand()) / RAND_MAX * windowHeight;
+            addBoid(x, y);
+        }
+    }
+    
+    void removeBoids(int count) {
+        if (count >= static_cast<int>(birds.size())) {
+            birds.clear();
+        } else {
+            birds.erase(birds.end() - count, birds.end());
+        }
+    }
+    
+    // Calculate average velocity magnitude for stats
+    float getAverageSpeed() const {
+        if (birds.empty()) return 0.0f;
+        
+        float totalSpeed = 0.0f;
+        for (const auto& boid : birds) {
+            totalSpeed += boid.velocity.magnitude();
+        }
+        return totalSpeed / birds.size();
+    }
+    
+    // Calculate flock coherence (how tightly grouped they are)
+    float getCoherence() const {
+        if (birds.size() < 2) return 0.0f;
+        
+        Vector2D center(0, 0);
+        for (const auto& boid : birds) {
+            center += boid.position;
+        }
+        center /= static_cast<float>(birds.size());
+        
+        float totalDistance = 0.0f;
+        for (const auto& boid : birds) {
+            totalDistance += Vector2D::distance(boid.position, center);
+        }
+        
+        return totalDistance / birds.size();
+    }
+};
+
 // ==========================
 // MAIN
 // ==========================
@@ -226,7 +608,7 @@ int main(int argc, char** argv) {
 
     // Instantiation of the renderer, controller that let us interact with sdl window.
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, 
-        SDL_RENDERER_SOFTWARE );
+        SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
 
     if (!renderer) {
         std::cerr << "[Error] SDL_CreateRenderer: " << SDL_GetError() << std::endl;
@@ -247,10 +629,14 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
         ImGui_ImplSDLRenderer2_Init(renderer);
     }
+
+    // Initialize flocking system
+    FlockingSystem flock(opt.width, opt.height);
+    flock.initializeBirds(opt.numBoids);
     
     // Performance tracking
     auto lastTime = std::chrono::high_resolution_clock::now();
-    // auto lastFlockingTime = std::chrono::microseconds(0);
+    auto lastFlockingTime = std::chrono::microseconds(0);
     auto lastUpdateTime = std::chrono::microseconds(0);
     auto lastRenderTime = std::chrono::microseconds(0);
     
@@ -281,16 +667,40 @@ int main(int argc, char** argv) {
             }
             
             else if (event.type == SDL_KEYDOWN) {
-                
                 switch (event.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         running = false;
+                        break;
+                    case SDLK_SPACE:
+                        paused = !paused;
+                        std::cout << (paused ? "Pausado" : "Reanudado") << "\n";
+                        break;
+                    case SDLK_p:
+                        opt.useParallel = !opt.useParallel;
+                        std::cout << "Modo cambiado a: " << (opt.useParallel ? "Paralelo" : "Serial") << "\n";
+                        break;
+                    case SDLK_t:
+                        opt.showTrails = !opt.showTrails;
+                        std::cout << "Estelas: " << (opt.showTrails ? "ON" : "OFF") << "\n";
+                        break;
+                    case SDLK_s:
+                        showDetailedStats = !showDetailedStats;
+                        break;
+                    case SDLK_PLUS:
+                    case SDLK_KP_PLUS:
+                        flock.addBoids(50);
+                        break;
+                    case SDLK_MINUS:
+                    case SDLK_KP_MINUS:
+                        flock.removeBoids(50);
                         break;
                 }
             }
 
             // Add boid at mouse position
             else if (event.type == SDL_MOUSEBUTTONDOWN) {
+                // Add boid at mouse position
+                flock.addBoid(static_cast<float>(event.button.x), static_cast<float>(event.button.y));
             }
 
             // Handle window events gracefully
@@ -298,8 +708,23 @@ int main(int argc, char** argv) {
                 if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
                     opt.width = event.window.data1;
                     opt.height = event.window.data2;
+                    flock.resize(opt.width, opt.height);
                 }
             }
+        }
+
+        if (!paused) {
+            // Update flocking with timing
+            auto flockingStart = std::chrono::high_resolution_clock::now();
+            
+            if (opt.useParallel) {
+                flock.updateParallel();
+            } else {
+                flock.updateSerial();
+            }
+            
+            auto flockingEnd = std::chrono::high_resolution_clock::now();
+            lastFlockingTime = std::chrono::duration_cast<std::chrono::microseconds>(flockingEnd - flockingStart);
         }
 
         // Render with timing
@@ -308,29 +733,51 @@ int main(int argc, char** argv) {
         SDL_SetRenderDrawColor(renderer, 20, 25, 40, 255);
         SDL_RenderClear(renderer);
 
+        flock.render(renderer);
+
         // Render ImGui overlay
         if (opt.showStats) {
             ImGui_ImplSDLRenderer2_NewFrame();
             ImGui_ImplSDL2_NewFrame();
             ImGui::NewFrame();
 
-            ImGui::SetNextWindowPos(ImVec2(10, 10));
-            ImGui::SetNextWindowBgAlpha(0.8f);
-            ImGui::Begin("Flocking", nullptr, 
-                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
-                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
-            ImGui::Text("Boids: %zu | FPS: %.0f | %s", 
-                       0, fps, 
-                       opt.useParallel ? "PAR" : "SER");
-            ImGui::Text("SPACE: pause | P: mode | T: trails | F1: stats");
-            if (paused) ImGui::TextColored(ImVec4(1,1,0,1), "PAUSED");
-            ImGui::End();
+            if (showDetailedStats) {
+                ImGui::Begin("Flocking Analysis", &showDetailedStats);
+                ImGui::Text("Boids: %zu", flock.getBoidCount());
+                ImGui::Text("FPS: %.1f", fps);
+                ImGui::Text("Flocking: %ld μs", lastFlockingTime.count());
+                ImGui::Text("Render: %ld μs", lastRenderTime.count());
+                ImGui::Text("Mode: %s", opt.useParallel ? "Parallel" : "Serial");
+                ImGui::Text("Avg Speed: %.2f", flock.getAverageSpeed());
+                ImGui::Text("Coherence: %.1f", flock.getCoherence());
+                ImGui::Text("Status: %s", paused ? "PAUSED" : "Running");
+                ImGui::Separator();
+                ImGui::Text("Controls:");
+                ImGui::Text("  SPACE: Pause/Resume");
+                ImGui::Text("  P: Toggle parallel mode");
+                ImGui::Text("  Click: Add boid");
+                ImGui::Text("  +/-: Add/remove 50 boids");
+                ImGui::End();
+            } else {
+                ImGui::SetNextWindowPos(ImVec2(10, 10));
+                ImGui::SetNextWindowBgAlpha(0.8f);
+                ImGui::Begin("Flocking", nullptr, 
+                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+                ImGui::Text("Boids: %zu | FPS: %.0f | %s", 
+                           flock.getBoidCount(), fps, 
+                           opt.useParallel ? "PAR" : "SER");
+                ImGui::Text("SPACE: pause | P: mode | S: stats");
+                if (paused) ImGui::TextColored(ImVec4(1,1,0,1), "PAUSED");
+                ImGui::End();
+            }
 
             ImGui::Render();
             // Flush im gui data to framebuffer.
             ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
         }
 
+        // FINALLY, SHOW CURRENT FRAMEBUFFER ON WINDOW!
         SDL_RenderPresent(renderer);
         
         auto renderEnd = std::chrono::high_resolution_clock::now();
