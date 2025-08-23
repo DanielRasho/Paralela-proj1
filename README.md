@@ -1,27 +1,33 @@
-# Paralela-proj1
+# Paralela-proj1: sCATsaver
 
-## Requisitos
+Made with <3 using SDL, ImGui, and OpenMP.
 
-- **Sistema operativo:** Linux, WSL (Ubuntu 20.04+), o macOS
-- **Compilador:** `GCC ≥ 9` o `Clang ≥ 10`
-- **CMake:** `≥ 3.10` (se recomienda 3.13+)
-- **Dependencias del sistema:**
+## Requirements
+
+- **Operating system**: Linux, WSL (Ubuntu 20.04+), or macOS
+- **Compiler**: GCC ≥ 9 or Clang ≥ 10
+- **CMake**: ≥ 3.10 (3.13+ recommended)
+- **System dependencies**: SDL, OpenMP
 
 ```bash
 sudo apt install build-essential cmake pkg-config \
 libglfw3-dev libglew-dev libglu1-mesa-dev mesa-common-dev \
-libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev
+libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
+libsdl2-dev libsdl2-image-dev
 ```
 
-## Construcción del Proyecto
+## Building the project
 
 ```bash
-git clone https://github.com/XavierLopez25/lit_locks_scheduler_ts.git
-cd lit_locks_scheduler_ts
-
 git submodule add https://github.com/ocornut/imgui.git external/imgui
 git submodule update --init --recursive
 
 chmod +x compile.sh
 ./compile.sh
 ```
+
+## References
+
+https://processing.org/examples/flocking.html
+
+https://ddavidhahn.github.io/cs184_projfinal/
