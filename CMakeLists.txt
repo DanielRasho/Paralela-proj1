@@ -58,6 +58,7 @@ set(IMGUI_SOURCES
 
 add_executable(screensaver
     src/main.cpp
+    src/cat.cpp
     ${IMGUI_SOURCES}
 )
 
@@ -67,27 +68,30 @@ target_include_directories(screensaver PRIVATE
 )
 
 # SDL2 linking - diferentes métodos según el sistema
+# SDL2
 if(TARGET SDL2::SDL2)
-    # Nuevo estilo de SDL2 (Ubuntu 22.04+, vcpkg, etc.)
     target_link_libraries(screensaver PRIVATE SDL2::SDL2)
-    if(TARGET SDL2_image::SDL2_image)
-        target_link_libraries(screensaver PRIVATE SDL2_image::SDL2_image)
-    endif()
 elseif(SDL2_LIBRARIES)
-    # Estilo tradicional con variables
     target_include_directories(screensaver PRIVATE ${SDL2_INCLUDE_DIRS})
     target_link_libraries(screensaver PRIVATE ${SDL2_LIBRARIES})
-    if(SDL2_IMAGE_LIBRARIES)
-        target_include_directories(screensaver PRIVATE ${SDL2_IMAGE_INCLUDE_DIRS})
-        target_link_libraries(screensaver PRIVATE ${SDL2_IMAGE_LIBRARIES})
-    endif()
 else()
-    # Fallback manual
     find_library(SDL2_LIBRARY SDL2)
-    find_library(SDL2_IMAGE_LIBRARY SDL2_image)
     target_link_libraries(screensaver PRIVATE ${SDL2_LIBRARY})
+endif()
+
+# SDL2_image 
+if(TARGET SDL2_image::SDL2_image)
+    target_link_libraries(screensaver PRIVATE SDL2_image::SDL2_image)
+elseif(SDL2_IMAGE_LIBRARIES)
+    target_include_directories(screensaver PRIVATE ${SDL2_IMAGE_INCLUDE_DIRS})
+    target_link_libraries(screensaver PRIVATE ${SDL2_IMAGE_LIBRARIES})
+else()
+    # último fallback
+    find_library(SDL2_IMAGE_LIBRARY SDL2_image)
     if(SDL2_IMAGE_LIBRARY)
         target_link_libraries(screensaver PRIVATE ${SDL2_IMAGE_LIBRARY})
+    else()
+        message(FATAL_ERROR "SDL2_image encontrado en configure pero no se pudo linkear; revisa instalación de libsdl2-image-dev")
     endif()
 endif()
 
