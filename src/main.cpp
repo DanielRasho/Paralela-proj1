@@ -14,6 +14,7 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
+#include "cat.hpp"
 
 // ===========================
 //  CONSTANTS
@@ -596,6 +597,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+
     SDL_Window* window = SDL_CreateWindow("Flocking Birds Simulation",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         opt.width, opt.height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -616,7 +619,33 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
-    
+
+    if ((IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG) == 0) {
+        std::cerr << "[Warn] IMG_Init PNG: " << IMG_GetError() << "\n";
+    }
+
+    Cat cat;
+    cat.scale = 3.f;
+    cat.speed = 140.f;
+
+    // Idle: 4 frames
+    cat.loadStrip(renderer, CatState::IdleBack,
+                "assets/cat_idle.png", 31, 36, /*frames=*/1, /*frameDur=*/0.35f);
+
+    // Walk left: 4 frames
+    cat.loadStrip(renderer, CatState::WalkLeft,
+        "assets/cat_walk_left.png", 31, 36, /*frames=*/4, /*frameDur=*/0.10f,
+        0, 0, 0);
+
+    // Walk right: 4 frames
+    cat.loadStrip(renderer, CatState::WalkRight,
+        "assets/cat_walk_right.png", 31, 36, /*frames=*/4, /*frameDur=*/0.10f,
+        0, 0, 0);
+
+    cat.strips[CatState::WalkUp] = cat.strips[CatState::IdleBack];
+
+    cat.placeAtBottom(opt.width, opt.height);
+
     // Initialize ImGui if GUI is enabled
     if (opt.showStats) {
         IMGUI_CHECKVERSION();
@@ -698,7 +727,9 @@ int main(int argc, char** argv) {
             }
 
             // Add boid at mouse position
-            else if (event.type == SDL_MOUSEBUTTONDOWN) {
+            else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+                // Move cat to mouse position
+                cat.goTo((float)event.button.x, (float)event.button.y);
                 // Add boid at mouse position
                 flock.addBoid(static_cast<float>(event.button.x), static_cast<float>(event.button.y));
             }
@@ -709,6 +740,7 @@ int main(int argc, char** argv) {
                     opt.width = event.window.data1;
                     opt.height = event.window.data2;
                     flock.resize(opt.width, opt.height);
+                    cat.placeAtBottom(opt.width, opt.height);
                 }
             }
         }
@@ -725,6 +757,14 @@ int main(int argc, char** argv) {
             
             auto flockingEnd = std::chrono::high_resolution_clock::now();
             lastFlockingTime = std::chrono::duration_cast<std::chrono::microseconds>(flockingEnd - flockingStart);
+
+            static auto lastT = std::chrono::high_resolution_clock::now();
+            auto nowT = std::chrono::high_resolution_clock::now();
+            float dt = std::chrono::duration<float>(nowT - lastT).count();
+            lastT = nowT;
+
+            cat.update(dt);
+            cat.clampToWindow(opt.width, opt.height);
         }
 
         // Render with timing
@@ -732,6 +772,8 @@ int main(int argc, char** argv) {
     
         SDL_SetRenderDrawColor(renderer, 20, 25, 40, 255);
         SDL_RenderClear(renderer);
+
+        cat.render(renderer);
 
         flock.render(renderer);
 
@@ -816,6 +858,7 @@ int main(int argc, char** argv) {
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    IMG_Quit();
     SDL_Quit();
 
     if (!opt.showStats) std::cout << "\n";
