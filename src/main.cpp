@@ -16,6 +16,8 @@
 #include "backends/imgui_impl_sdlrenderer2.h"
 #include "cat.hpp"
 
+#include <omp.h>
+
 // ===========================
 //  CONSTANTS
 // ==========================
@@ -232,7 +234,7 @@ public:
 
             acceleration = Vector2D(0, 0);
             
-            r = 3.0f;
+            r = 4.0f;
             maxSpeed = 2.0f;
             maxForce = 0.03f;
 
@@ -502,17 +504,165 @@ public:
     
     // Serial version - each boid processes neighbors 
     void updateParallel() {
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t i = 0; i < birds.size(); i++) {
-            birds[i].flock(birds, windowWidth, windowHeight);
-        }
-        
+        const size_t n = birds.size();
+        if (n == 0) return;
+
+        // SoA snapshot to improve locality and avoid false sharing
+        std::vector<float> px(n), py(n), vx(n), vy(n);
         #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < birds.size(); i++) {
+        for (size_t i = 0; i < n; ++i) {
+            px[i] = birds[i].position.x;
+            py[i] = birds[i].position.y;
+            vx[i] = birds[i].velocity.x;
+            vy[i] = birds[i].velocity.y;
+        }
+
+        // Buffer for accelerations
+        std::vector<float> ax(n, 0.0f), ay(n, 0.0f);
+
+        // Si todos los boids comparten radios (como en tu ctor), cachea radios^2
+        // If all of the boids share the same radiius, caches squared radius
+        const float sepR2 = birds[0].separationRadius * birds[0].separationRadius;
+        const float aliR2 = birds[0].alignmentRadius  * birds[0].alignmentRadius;
+        const float cohR2 = birds[0].cohesionRadius   * birds[0].cohesionRadius;
+
+        // Calculate forces in parallel with SoA access
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            const float pix = px[i], piy = py[i];
+            const float vix = vx[i], viy = vy[i];
+            float sep_x = 0.f, sep_y = 0.f; int sep_c = 0;
+            float ali_x = 0.f, ali_y = 0.f; int ali_c = 0;
+            float coh_x = 0.f, coh_y = 0.f; int coh_c = 0;
+
+            // Neighboors: vectorizable with simd
+            #pragma omp simd reduction(+:sep_x, sep_y, sep_c, ali_x, ali_y, ali_c, coh_x, coh_y, coh_c)
+            for (size_t j = 0; j < n; ++j) {
+                const float dx = pix - px[j];
+                const float dy = piy - py[j];
+                const float d2 = dx*dx + dy*dy;
+
+                if (d2 > 0.f) {
+                    if (d2 < sepR2) {
+                        // diff.normalize(); diff/=d  -> invsqrt * inv (equals a /d)
+                        const float invd = 1.0f / std::sqrt(d2);
+                        sep_x += dx * invd * invd;
+                        sep_y += dy * invd * invd;
+                        sep_c++;
+                    }
+                    if (d2 < aliR2) {
+                        ali_x += vx[j];
+                        ali_y += vy[j];
+                        ali_c++;
+                    }
+                    if (d2 < cohR2) {
+                        coh_x += px[j];
+                        coh_y += py[j];
+                        coh_c++;
+                    }
+                }
+            }
+
+            // Combine into a local "acc" using fast limit version
+            auto fast_limit = [](float& x, float& y, float maxMag) {
+                const float s2 = x*x + y*y;
+                const float m2 = maxMag * maxMag;
+                if (s2 > m2 && s2 > 0.f) {
+                    const float inv = maxMag / std::sqrt(s2);
+                    x *= inv; y *= inv;
+                }
+            };
+
+            float acc_x = 0.f, acc_y = 0.f;
+
+            // Separation (weight 1.5)
+            if (sep_c > 0) {
+                float sx = sep_x / sep_c, sy = sep_y / sep_c;
+                const float s2 = sx*sx + sy*sy;
+                if (s2 > 0.f) {
+                    const float inv = 1.0f / std::sqrt(s2);
+                    sx *= inv; sy *= inv;
+                    sx *= birds[i].maxSpeed; sy *= birds[i].maxSpeed;
+                    sx -= vix; sy -= viy;
+                    fast_limit(sx, sy, birds[i].maxForce);
+                    acc_x += 1.5f * sx;
+                    acc_y += 1.5f * sy;
+                }
+            }
+
+            // Alignment
+            if (ali_c > 0) {
+                float axm = ali_x / ali_c, aym = ali_y / ali_c;
+                const float s2 = axm*axm + aym*aym;
+                if (s2 > 0.f) {
+                    const float inv = 1.0f / std::sqrt(s2);
+                    axm *= inv; aym *= inv;
+                    axm *= birds[i].maxSpeed; aym *= birds[i].maxSpeed;
+                    axm -= vix; aym -= viy;
+                    fast_limit(axm, aym, birds[i].maxForce);
+                    acc_x += axm;
+                    acc_y += aym;
+                }
+            }
+
+            // Cohesion
+            if (coh_c > 0) {
+                const float tx = coh_x / coh_c, ty = coh_y / coh_c;
+                float dx = tx - pix, dy = ty - piy;
+                const float s2 = dx*dx + dy*dy;
+                if (s2 > 0.f) {
+                    const float inv = 1.0f / std::sqrt(s2);
+                    dx *= inv; dy *= inv;
+                    dx *= birds[i].maxSpeed; dy *= birds[i].maxSpeed;
+                    dx -= vix; dy -= viy;
+                    fast_limit(dx, dy, birds[i].maxForce);
+                    acc_x += dx;
+                    acc_y += dy;
+                }
+            }
+
+            // Environmental bias
+            {
+                float bx = 0.5f, by;
+                const float upperHalf = windowHeight * 0.3f;
+                if (piy > upperHalf) {
+                    const float distanceFromTop = (piy - upperHalf) / upperHalf;
+                    by = -distanceFromTop * 0.8f;
+                } else {
+                    by = 0.15f;
+                }
+                const float idealY = windowHeight * 0.2f;
+                const float distanceFromIdeal = std::abs(piy - idealY) / (windowHeight * 0.5f);
+
+                // steer = norm(bias) * maxSpeed*(0.3 + d*0.5) - v
+                float bsx = bx, bsy = by;
+                const float b2 = bsx*bsx + bsy*bsy;
+                if (b2 > 0.f) {
+                    const float inv = 1.0f / std::sqrt(b2);
+                    bsx *= inv; bsy *= inv;
+                    const float speed = birds[i].maxSpeed * (0.3f + distanceFromIdeal * 0.5f);
+                    bsx *= speed; bsy *= speed;
+                    bsx -= vix;   bsy -= viy;
+                    fast_limit(bsx, bsy, birds[i].maxForce * 0.5f);
+                    acc_x += 0.8f * bsx;
+                    acc_y += 0.8f * bsy;
+                }
+            }
+
+            ax[i] = acc_x;
+            ay[i] = acc_y;
+        }
+
+        // Parallel integration (only one operation per bird)
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            birds[i].acceleration.x += ax[i];
+            birds[i].acceleration.y += ay[i];
             birds[i].update();
             birds[i].borders(windowWidth, windowHeight);
         }
     }
+
     
     void render(SDL_Renderer* renderer) {
         for (const auto& bird : birds) {
@@ -547,30 +697,37 @@ public:
     // Calculate average velocity magnitude for stats
     float getAverageSpeed() const {
         if (birds.empty()) return 0.0f;
-        
-        float totalSpeed = 0.0f;
-        for (const auto& boid : birds) {
-            totalSpeed += boid.velocity.magnitude();
-        }
-        return totalSpeed / birds.size();
+        double total = 0.0;
+        #pragma omp parallel for reduction(+:total) schedule(static)
+        for (size_t i = 0; i < birds.size(); ++i)
+            total += birds[i].velocity.magnitude();
+        return static_cast<float>(total / birds.size());
     }
     
     // Calculate flock coherence (how tightly grouped they are)
     float getCoherence() const {
-        if (birds.size() < 2) return 0.0f;
-        
-        Vector2D center(0, 0);
-        for (const auto& boid : birds) {
-            center += boid.position;
+        const size_t n = birds.size();
+        if (n < 2) return 0.0f;
+
+        // Centro
+        // Center
+        double cx = 0.0, cy = 0.0;
+        #pragma omp parallel for reduction(+:cx,cy) schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            cx += birds[i].position.x;
+            cy += birds[i].position.y;
         }
-        center /= static_cast<float>(birds.size());
-        
-        float totalDistance = 0.0f;
-        for (const auto& boid : birds) {
-            totalDistance += Vector2D::distance(boid.position, center);
+        cx /= n; cy /= n;
+
+        // Average distance to center
+        double totalDist = 0.0;
+        #pragma omp parallel for reduction(+:totalDist) schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            const float dx = birds[i].position.x - static_cast<float>(cx);
+            const float dy = birds[i].position.y - static_cast<float>(cy);
+            totalDist += std::sqrt(dx*dx + dy*dy);
         }
-        
-        return totalDistance / birds.size();
+        return static_cast<float>(totalDist / n);
     }
 };
 
@@ -611,7 +768,7 @@ int main(int argc, char** argv) {
 
     // Instantiation of the renderer, controller that let us interact with sdl window.
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, 
-        SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_SOFTWARE);
 
     if (!renderer) {
         std::cerr << "[Error] SDL_CreateRenderer: " << SDL_GetError() << std::endl;
