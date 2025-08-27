@@ -546,6 +546,13 @@ public:
         if (n == 0) return;
 
         // SoA snapshot to improve locality and avoid false sharing
+
+        // (b) Optimización de estructuras de datos (SoA):
+        //     Se crea un *snapshot* en arreglos contiguos px/py/vx/vy (Structure of Arrays).
+        //     Razón: mejora la localidad de caché y facilita la vectorización del loop de vecinos,
+        //             separando lectura (SoA) de escritura (ax/ay/birds), lo que reduce contención.
+
+
         std::vector<float> px(n), py(n), vx(n), vy(n);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; ++i) {
@@ -556,10 +563,20 @@ public:
         }
 
         // Buffer for accelerations
+
+        // (c) Optimización de acceso a memoria compartida:
+        //     Buffers temporales de aceleración (ax/ay) por boid. Cada hilo escribe solo su índice,
+        //     evitando *data races* y *false sharing*. La escritura al objeto compartido birds[i]
+        //     se difiere a la fase de integración.
+
         std::vector<float> ax(n, 0.0f), ay(n, 0.0f);
 
-        // Si todos los boids comparten radios (como en tu ctor), cachea radios^2
         // If all of the boids share the same radiius, caches squared radius
+
+        // (b) Optimización de estructuras de datos:
+        //     Cacheo de radios^2 para comparar d2 < R^2 y evitar sqrt en el test de vecindad.
+        //     Esto reduce operaciones costosas dentro del bucle más caliente.
+
         const float sepR2 = birds[0].separationRadius * birds[0].separationRadius;
         const float aliR2 = birds[0].alignmentRadius  * birds[0].alignmentRadius;
         const float cohR2 = birds[0].cohesionRadius   * birds[0].cohesionRadius;
@@ -574,6 +591,12 @@ public:
             float coh_x = 0.f, coh_y = 0.f; int coh_c = 0;
 
             // Neighboors: vectorizable with simd
+
+            // (a) Directivas/cláusulas OpenMP no vistas en la intro:
+            //     Uso de `#pragma omp simd` con múltiples `reduction(+: ...)` para vectorizar el
+            //     bucle de vecinos (índice j). Razón: explota SIMD/ILP, acumula en registros
+            //     vectoriales sin locks/atómicas, elevando el throughput del O(n^2).
+
             #pragma omp simd reduction(+:sep_x, sep_y, sep_c, ali_x, ali_y, ali_c, coh_x, coh_y, coh_c)
             for (size_t j = 0; j < n; ++j) {
                 const float dx = pix - px[j];
@@ -602,6 +625,12 @@ public:
             }
 
             // Combine into a local "acc" using fast limit version
+
+            // (d) Otra optimización algorítmica documentable:
+            //     `fast_limit`: limita por norma sin normalizaciones intermedias ni cálculos extra.
+            //     Razón: evita trabajo cuando el vector ya está bajo el umbral y usa una sola sqrt
+            //            en el caso de reescalado, reduciendo costo en la ruta crítica.
+
             auto fast_limit = [](float& x, float& y, float maxMag) {
                 const float s2 = x*x + y*y;
                 const float m2 = maxMag * maxMag;
@@ -692,6 +721,12 @@ public:
         }
 
         // Parallel integration (only one operation per bird)
+
+        // (c) Optimización de acceso a memoria compartida:
+        //     Fase 2 (integración): patrón write-once, secuencial por boid.
+        //     Razón: consolidar las escrituras en una sola pasada minimiza contención,
+        //            mejora la localidad y reduce *false sharing* en caché.
+
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; ++i) {
             birds[i].acceleration.x += ax[i];
