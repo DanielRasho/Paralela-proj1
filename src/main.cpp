@@ -37,7 +37,11 @@ struct CLI_Options {
     bool showStats = true;
     bool useParallel = true;
     bool showTrails = false;
+    bool useSunset = true;
+    bool darkBoids = false;
 };
+
+struct RGBA { Uint8 r, g, b, a; };
 
 // ===========================
 //  UTILITY FUNCTION
@@ -47,6 +51,29 @@ static bool parseInt(const char* s, int& out) {
     std::istringstream iss(s);
     iss >> out;
     return !iss.fail();
+}
+
+static inline Uint8 u8lerp(Uint8 a, Uint8 b, float t) { return (Uint8)(a + (b - a) * t); }
+
+static inline RGBA mix(const RGBA& a, const RGBA& b, float t) {
+    return { u8lerp(a.r,b.r,t), u8lerp(a.g,b.g,t), u8lerp(a.b,b.b,t), u8lerp(a.a,b.a,t) };
+}
+
+static void drawSunsetGradient(SDL_Renderer* r, int w, int h, float split) {
+    const RGBA top    = {255, 136,  0, 255};
+    const RGBA mid    = {255,  66, 123, 255};
+    const RGBA bottom = { 46,  26,  71, 255};
+
+    const int bandH = 2; 
+    for (int y = 0; y < h; y += bandH) {
+        float t = (float)y / (float)(h - 1);
+        RGBA c = (t < split)
+            ? mix(top, mid, t / split)
+            : mix(mid, bottom, (t - split) / (1.f - split));
+        SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
+        SDL_Rect row{0, y, w, std::min(bandH, h - y)};
+        SDL_RenderFillRect(r, &row);
+    }
 }
 
 // Representation of a 2D vector
@@ -170,6 +197,9 @@ static CLI_Options parseArgs(int argc, char** argv) {
         else if (a == "--no-gui") opt.showStats = false;
         else if (a == "--serial") opt.useParallel = false;
         else if (a == "--trails") opt.showTrails = true;
+        else if (a == "--sunset")     opt.useSunset = true;
+        else if (a == "--no-sunset")  opt.useSunset = false;
+        else if (a == "--dark-boids") opt.darkBoids = true;
         // Print help message
         else if (a == "-?" || a == "--help") {
             std::cout << "Uso: flocking [num_boids] [opciones]\n";
@@ -417,7 +447,7 @@ public:
         }
 
         // Draws the birds onto window , based on current fields.
-        void render(SDL_Renderer* renderer) const {
+        void render(SDL_Renderer* renderer, bool dark) const {
             // Draw boid as triangle pointing in direction of velocity
             float theta = velocity.heading() + PI / 2;
             
@@ -444,9 +474,17 @@ public:
             v1 += position;
             v2 += position;
             v3 += position;
-            
-            // Draw filled triangle (approximate with lines)
-            SDL_SetRenderDrawColor(renderer, red, green, blue, alpha);
+
+            Uint8 R = red, G = green, B = blue, A = alpha;
+            if (dark) {
+                R = (Uint8)(R * 0.35f);
+                G = (Uint8)(G * 0.35f);
+                B = (Uint8)(B * 0.45f);
+                SDL_SetRenderDrawColor(renderer, R, G, B, A);
+            } else {
+                // Draw filled triangle (approximate with lines)
+                SDL_SetRenderDrawColor(renderer, red, green, blue, alpha);
+            }
             
             // Draw triangle outline
             SDL_RenderDrawLine(renderer, static_cast<int>(v1.x), static_cast<int>(v1.y),
@@ -664,9 +702,9 @@ public:
     }
 
     
-    void render(SDL_Renderer* renderer) {
+    void render(SDL_Renderer* renderer, bool darkBoids) {
         for (const auto& bird : birds) {
-            bird.render(renderer);
+            bird.render(renderer, darkBoids);
         }
     }
     
@@ -880,6 +918,14 @@ int main(int argc, char** argv) {
                     case SDLK_KP_MINUS:
                         flock.removeBoids(50);
                         break;
+                    case SDLK_b:
+                        opt.useSunset = !opt.useSunset;
+                        std::cout << "Fondo: " << (opt.useSunset ? "Sunset" : "Plano") << "\n";
+                        break;
+                    case SDLK_c:
+                        opt.darkBoids = !opt.darkBoids;
+                        std::cout << "Boids: " << (opt.darkBoids ? "Oscuros" : "Originales") << "\n";
+                        break;
                 }
             }
 
@@ -925,14 +971,22 @@ int main(int argc, char** argv) {
         }
 
         // Render with timing
+        auto lastTime = std::chrono::high_resolution_clock::now();
+        const auto startTime = lastTime;
         auto renderStart = std::chrono::high_resolution_clock::now();
     
-        SDL_SetRenderDrawColor(renderer, 20, 25, 40, 255);
-        SDL_RenderClear(renderer);
+        if (opt.useSunset) {
+            float tsec  = std::chrono::duration<float>(renderStart - startTime).count();
+            float split = 0.45f + 0.1f * std::sin(tsec * 0.2f);
+            drawSunsetGradient(renderer, opt.width, opt.height, split);
+        } else {
+            SDL_SetRenderDrawColor(renderer, 20, 25, 40, 255);
+            SDL_RenderClear(renderer);
+        }
 
         cat.render(renderer);
 
-        flock.render(renderer);
+        flock.render(renderer, opt.darkBoids);
 
         // Render ImGui overlay
         if (opt.showStats) {
@@ -950,6 +1004,10 @@ int main(int argc, char** argv) {
                 ImGui::Text("Avg Speed: %.2f", flock.getAverageSpeed());
                 ImGui::Text("Coherence: %.1f", flock.getCoherence());
                 ImGui::Text("Status: %s", paused ? "PAUSED" : "Running");
+                ImGui::Text("Fondo: %s | Boids: %s",
+                            opt.useSunset ? "Sunset" : "Plano",
+                            opt.darkBoids ? "Oscuros" : "Originales");
+                ImGui::Text("B: fondo | C: color boids");
                 ImGui::Separator();
                 ImGui::Text("Controls:");
                 ImGui::Text("  SPACE: Pause/Resume");
