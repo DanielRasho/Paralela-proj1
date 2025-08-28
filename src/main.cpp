@@ -7,6 +7,8 @@
 #include <memory>
 #include <algorithm>
 #include <vector>
+#include <limits>
+#include <cctype>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -19,6 +21,13 @@
 #include <omp.h>
 
 // ===========================
+// GLOBAL LIMITS
+// ===========================
+
+constexpr int MIN_BOIDS = 1;
+constexpr int MAX_BOIDS = 3000;
+
+// ===========================
 //  CONSTANTS
 // ==========================
 
@@ -29,7 +38,7 @@ constexpr float TWO_PI = 2.0f * PI;
 //  STRUCTS
 // ==========================
 
-
+// Command Line Options
 struct CLI_Options {
     int width = 0;
     int height = 0;
@@ -41,29 +50,45 @@ struct CLI_Options {
     bool darkBoids = false;
 };
 
+// RGBA color
 struct RGBA { Uint8 r, g, b, a; };
 
 // ===========================
 //  UTILITY FUNCTION
 // ==========================
-static bool parseInt(const char* s, int& out) {
-    if (!s) return false;
-    std::istringstream iss(s);
-    iss >> out;
-    return !iss.fail();
+
+// Parses a non-negative integer strictly (no extra chars, no negatives)
+static bool parseStrictNonNegInt(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    size_t i = 0;
+    if (s[0] == '+') i = 1;
+    if (i >= s.size()) return false;
+
+    long long val = 0;
+    for (; i < s.size(); ++i) {
+        if (!std::isdigit((unsigned char)s[i])) return false;  // invalid char
+        val = val * 10 + (s[i] - '0');
+        if (val > std::numeric_limits<int>::max()) return false;  // overflow
+    }
+    out = static_cast<int>(val);
+    return true; 
 }
 
+// Linear interpolation between two Uint8 values
 static inline Uint8 u8lerp(Uint8 a, Uint8 b, float t) { return (Uint8)(a + (b - a) * t); }
 
+// Linear interpolation between two RGBA colors
 static inline RGBA mix(const RGBA& a, const RGBA& b, float t) {
     return { u8lerp(a.r,b.r,t), u8lerp(a.g,b.g,t), u8lerp(a.b,b.b,t), u8lerp(a.a,b.a,t) };
 }
 
+// Draws a vertical gradient from top to bottom with a color transition at 'split' (0..1)
 static void drawSunsetGradient(SDL_Renderer* r, int w, int h, float split) {
     const RGBA top    = {255, 136,  0, 255};
     const RGBA mid    = {255,  66, 123, 255};
     const RGBA bottom = { 46,  26,  71, 255};
 
+    // Draw in bands to avoid per-pixel overhead
     const int bandH = 2; 
     for (int y = 0; y < h; y += bandH) {
         float t = (float)y / (float)(h - 1);
@@ -140,6 +165,7 @@ struct Vector2D {
         }
     }
     
+    // Returns a normalized copy of the vector
     Vector2D normalized() const {
         Vector2D result = *this;
         result.normalized();
@@ -169,6 +195,21 @@ struct Vector2D {
     }
 };
 
+// Warns about invalid boids number and shows fallback
+static void warnInvalidBoids(const std::string& raw, int fallback) {
+    std::cerr << "[Advertencia] Valor inválido para número de boids: \"" << raw
+              << "\". Debe ser un entero >= " << MIN_BOIDS
+              << " (sin decimales). Se usará el valor predeterminado: "
+              << fallback << ".\n";
+}
+
+// Detects if a string looks like a number (starts with digit, + or -)
+static bool looksLikeNumber(const std::string& s) {
+    if (s.empty()) return false;
+    const unsigned char c0 = (unsigned char)s[0];
+    return std::isdigit(c0) || s[0] == '+' || s[0] == '-';
+}
+
 // Retrieve passed on CLI
 static CLI_Options parseArgs(int argc, char** argv) {
     CLI_Options opt;
@@ -185,15 +226,22 @@ static CLI_Options parseArgs(int argc, char** argv) {
         
         // Parses the first argument "n" number of birds
         int num;
-        if (parseInt(a.c_str(), num) && num > 0) {
-            opt.numBoids = num;
+        if (parseStrictNonNegInt(a, num)) { // looks like a valid number
+            if (num >= MIN_BOIDS) {
+                opt.numBoids = std::min(num, MAX_BOIDS); // clamp to max
+            } else {
+                warnInvalidBoids(a, opt.numBoids); 
+            }
+            continue;
+        } else if (looksLikeNumber(a)) { // looks like a number but is not valid
+            warnInvalidBoids(a, opt.numBoids); 
             continue;
         }
 
         // The rest of the arguments are passed with with flags
-        if (auto v = eat("--width");  !v.empty())  parseInt(v.c_str(), opt.width);
-        else if (auto v = eat("--height"); !v.empty()) parseInt(v.c_str(), opt.height);
-        else if (auto v = eat("--boids"); !v.empty()) parseInt(v.c_str(), opt.numBoids);
+        if (auto v = eat("--width");  !v.empty())  parseStrictNonNegInt(v.c_str(), opt.width);
+        else if (auto v = eat("--height"); !v.empty()) parseStrictNonNegInt(v.c_str(), opt.height);
+        else if (auto v = eat("--boids"); !v.empty()) parseStrictNonNegInt(v.c_str(), opt.numBoids);
         else if (a == "--no-gui") opt.showStats = false;
         else if (a == "--serial") opt.useParallel = false;
         else if (a == "--trails") opt.showTrails = true;
@@ -213,6 +261,8 @@ static CLI_Options parseArgs(int argc, char** argv) {
             std::cout << "Ejemplo: flocking 500 --width 1920 --height 1080 --trails\n";
             std::exit(0);
         }
+        if (opt.numBoids < MIN_BOIDS) opt.numBoids = MIN_BOIDS;
+        if (opt.numBoids > MAX_BOIDS) opt.numBoids = MAX_BOIDS;
     }
 
     return opt;
@@ -225,9 +275,11 @@ static int askInt(const std::string& prompt, int minVal, int fallback) {
         std::string line; std::getline(std::cin, line);
         if (line.empty()) return fallback;
         std::istringstream iss(line);
+        
         int v = 0; iss >> v;
-        if (!iss.fail() && v >= minVal) return v;
-        std::cout << "Valor inválido, intenta de nuevo.\n";
+        
+        if (parseStrictNonNegInt(line, v) && v >= minVal) return v;
+        std::cout << "Valor inválido. Debe ser un entero >= " << minVal << " (sin decimales).\n";
     }
 }
 
@@ -657,7 +709,7 @@ public:
                 }
             }
 
-            // Alignment
+            // Alignment 
             if (ali_c > 0) {
                 float axm = ali_x / ali_c, aym = ali_y / ali_c;
                 const float s2 = axm*axm + aym*aym;
@@ -672,7 +724,7 @@ public:
                 }
             }
 
-            // Cohesion
+            // Cohesion 
             if (coh_c > 0) {
                 const float tx = coh_x / coh_c, ty = coh_y / coh_c;
                 float dx = tx - pix, dy = ty - piy;
@@ -736,7 +788,7 @@ public:
         }
     }
 
-    
+    // Renders all the birds in the system
     void render(SDL_Renderer* renderer, bool darkBoids) {
         for (const auto& bird : birds) {
             bird.render(renderer, darkBoids);
@@ -749,24 +801,28 @@ public:
         windowHeight = height;
     }
     
+    // Returns the current number of boids
     size_t getBoidCount() const { return birds.size(); }
     
+    // Add or remove boids to reach target count
     void addBoids(int count) {
-        for (int i = 0; i < count; i++) {
+        if (count <= 0) return;
+        const int canAdd = std::min(count, std::max(0, MAX_BOIDS - (int)birds.size()));
+        for (int i = 0; i < canAdd; i++) {
             float x = static_cast<float>(rand()) / RAND_MAX * windowWidth;
             float y = static_cast<float>(rand()) / RAND_MAX * windowHeight;
             addBoid(x, y);
         }
     }
-    
+
+    // Remove boids from the end of the list, keeping at least MIN_BOIDS
     void removeBoids(int count) {
-        if (count >= static_cast<int>(birds.size())) {
-            birds.clear();
-        } else {
-            birds.erase(birds.end() - count, birds.end());
-        }
+        if (count <= 0 || birds.empty()) return;
+        const int remove = std::min(count, (int)birds.size() - MIN_BOIDS);
+        if (remove <= 0) return;
+        birds.erase(birds.end() - remove, birds.end());
     }
-    
+
     // Calculate average velocity magnitude for stats
     float getAverageSpeed() const {
         if (birds.empty()) return 0.0f;
@@ -782,7 +838,6 @@ public:
         const size_t n = birds.size();
         if (n < 2) return 0.0f;
 
-        // Centro
         // Center
         double cx = 0.0, cy = 0.0;
         #pragma omp parallel for reduction(+:cx,cy) schedule(static)
@@ -827,12 +882,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Set texture filtering to nearest (no smoothing)
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
+    // Create window
     SDL_Window* window = SDL_CreateWindow("Flocking Birds Simulation",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         opt.width, opt.height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     
+    // Error creating window
     if (!window) {
         std::cerr << "[Error] SDL_CreateWindow: " << SDL_GetError() << std::endl;
         SDL_Quit();
@@ -850,10 +908,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Initialize SDL_image for PNG loading
     if ((IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG) == 0) {
         std::cerr << "[Warn] IMG_Init PNG: " << IMG_GetError() << "\n";
     }
 
+    // Load cat sprite strips
     Cat cat;
     cat.scale = 3.f;
     cat.speed = 140.f;
@@ -872,9 +932,9 @@ int main(int argc, char** argv) {
         "assets/cat_walk_right.png", 31, 36, /*frames=*/4, /*frameDur=*/0.10f,
         0, 0, 0);
 
-    cat.strips[CatState::WalkUp] = cat.strips[CatState::IdleBack];
+    cat.strips[CatState::WalkUp] = cat.strips[CatState::IdleBack]; // Reuse idle for up
 
-    cat.placeAtBottom(opt.width, opt.height);
+    cat.placeAtBottom(opt.width, opt.height); // Start at bottom center
 
     // Initialize ImGui if GUI is enabled
     if (opt.showStats) {
@@ -899,9 +959,9 @@ int main(int argc, char** argv) {
     auto lastUpdateTime = std::chrono::microseconds(0);
     auto lastRenderTime = std::chrono::microseconds(0);
     
-    float fps = 0.0f;
-    int frameCount = 0;
-    auto lastStatsTime = lastTime;
+    float fps = 0.0f; // Smoothed FPS
+    int frameCount = 0; // Frames since last FPS update
+    auto lastStatsTime = lastTime; /// Time of last stats update
 
     bool running = true;
     bool showDetailedStats = false;
@@ -921,6 +981,7 @@ int main(int argc, char** argv) {
                 ImGui_ImplSDL2_ProcessEvent(&event);
             }
             
+            // Handle quit event
             if (event.type == SDL_QUIT){
                 running = false;
             }
@@ -932,15 +993,15 @@ int main(int argc, char** argv) {
                         break;
                     case SDLK_SPACE:
                         paused = !paused;
-                        std::cout << (paused ? "Pausado" : "Reanudado") << "\n";
+                        std::cout << (paused ? "Paused" : "Resumed") << "\n";
                         break;
                     case SDLK_p:
                         opt.useParallel = !opt.useParallel;
-                        std::cout << "Modo cambiado a: " << (opt.useParallel ? "Paralelo" : "Serial") << "\n";
+                        std::cout << "Mode change to: " << (opt.useParallel ? "Paralell" : "Sequential") << "\n";
                         break;
                     case SDLK_t:
                         opt.showTrails = !opt.showTrails;
-                        std::cout << "Estelas: " << (opt.showTrails ? "ON" : "OFF") << "\n";
+                        std::cout << "Steles: " << (opt.showTrails ? "ON" : "OFF") << "\n";
                         break;
                     case SDLK_s:
                         showDetailedStats = !showDetailedStats;
@@ -950,16 +1011,18 @@ int main(int argc, char** argv) {
                         flock.addBoids(50);
                         break;
                     case SDLK_MINUS:
-                    case SDLK_KP_MINUS:
-                        flock.removeBoids(50);
+                    case SDLK_KP_MINUS: {
+                        int canRemove = (int)flock.getBoidCount() - MIN_BOIDS;
+                        if (canRemove > 0) flock.removeBoids(std::min(50, canRemove));
                         break;
+                    }
                     case SDLK_b:
                         opt.useSunset = !opt.useSunset;
-                        std::cout << "Fondo: " << (opt.useSunset ? "Sunset" : "Plano") << "\n";
+                        std::cout << "Background: " << (opt.useSunset ? "Sunset" : "Dark") << "\n";
                         break;
                     case SDLK_c:
                         opt.darkBoids = !opt.darkBoids;
-                        std::cout << "Boids: " << (opt.darkBoids ? "Oscuros" : "Originales") << "\n";
+                        std::cout << "Boids: " << (opt.darkBoids ? "Black" : "Color") << "\n";
                         break;
                 }
             }
@@ -1039,10 +1102,11 @@ int main(int argc, char** argv) {
                 ImGui::Text("Avg Speed: %.2f", flock.getAverageSpeed());
                 ImGui::Text("Coherence: %.1f", flock.getCoherence());
                 ImGui::Text("Status: %s", paused ? "PAUSED" : "Running");
-                ImGui::Text("Fondo: %s | Boids: %s",
+                ImGui::Text("Background: %s | Boids: %s",
                             opt.useSunset ? "Sunset" : "Plano",
                             opt.darkBoids ? "Oscuros" : "Originales");
-                ImGui::Text("B: fondo | C: color boids");
+                ImGui::Text("B: change background | C: change color boids");
+                ImGui::Text("P: change parallel/secuencial mode");
                 ImGui::Separator();
                 ImGui::Text("Controls:");
                 ImGui::Text("  SPACE: Pause/Resume");
@@ -1106,14 +1170,13 @@ int main(int argc, char** argv) {
         ImGui::DestroyContext();
     }
 
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    IMG_Quit();
-    SDL_Quit();
+    SDL_DestroyRenderer(renderer); // This also destroys any associated textures
+    SDL_DestroyWindow(window); // This also destroys the renderer
+    IMG_Quit(); // Quit SDL_image
+    SDL_Quit(); // Quit SDL subsystems
 
     if (!opt.showStats) std::cout << "\n";
     std::cout << "Simulación terminada.\n";
-
 
     return 0;
 }

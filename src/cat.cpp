@@ -1,5 +1,6 @@
 #include "cat.hpp"
 
+// Destructor: frees textures
 Cat::~Cat() {
     for (auto& [_, s] : strips) {
         if (s.tex) SDL_DestroyTexture(s.tex);

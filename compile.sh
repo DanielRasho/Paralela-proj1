@@ -9,4 +9,4 @@ cd build
 cmake ..
 make -j
 
-echo "✅ Compilación completada."
+echo "Compilación completada."

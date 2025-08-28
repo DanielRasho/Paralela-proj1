@@ -24,6 +24,7 @@ git submodule update --init --recursive
 
 chmod +x compile.sh
 ./compile.sh
+./build/screensaver
 ```
 
 ## References
