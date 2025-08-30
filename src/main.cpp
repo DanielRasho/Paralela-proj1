@@ -48,6 +48,16 @@ struct CLI_Options {
     bool showTrails = false;
     bool useSunset = true;
     bool darkBoids = false;
+
+    // Benchmark Mode:
+    bool bench = false;        // Benchmark Mode (without SDL/render)
+    int frames = 600;          // frames per test
+    int trials = 10;           // number of measurements per configuration
+    int threads = 0;           // OMP threads (0 = runtime default)
+    unsigned seed = 12345;     // RNG seed
+    std::string csvPath;       // CSV output path (empty = stdout only)
+    std::string mode = "both"; // "serial" | "parallel" | "both"
+
 };
 
 // RGBA color
@@ -206,8 +216,16 @@ static void warnInvalidBoids(const std::string& raw, int fallback) {
 // Detects if a string looks like a number (starts with digit, + or -)
 static bool looksLikeNumber(const std::string& s) {
     if (s.empty()) return false;
-    const unsigned char c0 = (unsigned char)s[0];
-    return std::isdigit(c0) || s[0] == '+' || s[0] == '-';
+    size_t i = 0;
+    if (s[0] == '+' || s[0] == '-') {
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return false;
+        i = 1;
+    } else if (!std::isdigit((unsigned char)s[0])) {
+        return false;
+    }
+    for (size_t k = i + 1; k < s.size(); ++k)
+        if (!std::isdigit((unsigned char)s[k])) return false;
+    return true;
 }
 
 // Retrieve passed on CLI
@@ -219,23 +237,23 @@ static CLI_Options parseArgs(int argc, char** argv) {
         
         // Lambda to consume the next parameters
         auto eat = [&](const std::string& key) {
-            if (a == key && i + i < argc) return std::string(argv[++i]);
+            if (a == key && i + 1 < argc) return std::string(argv[++i]);
             if (a.rfind(key + "=", 0) == 0) return a.substr(key.size() + 1);
             return std::string();
         };
         
         // Parses the first argument "n" number of birds
-        int num;
-        if (parseStrictNonNegInt(a, num)) { // looks like a valid number
-            if (num >= MIN_BOIDS) {
-                opt.numBoids = std::min(num, MAX_BOIDS); // clamp to max
-            } else {
-                warnInvalidBoids(a, opt.numBoids); 
+        // Only consider number if it not starts with '-'
+        if (!a.empty() && a[0] != '-') {
+            int num;
+            if (parseStrictNonNegInt(a, num)) {
+                if (num >= MIN_BOIDS) opt.numBoids = std::min(num, MAX_BOIDS);
+                else warnInvalidBoids(a, opt.numBoids);
+                continue;
+            } else if (looksLikeNumber(a)) {
+                warnInvalidBoids(a, opt.numBoids);
+                continue;
             }
-            continue;
-        } else if (looksLikeNumber(a)) { // looks like a number but is not valid
-            warnInvalidBoids(a, opt.numBoids); 
-            continue;
         }
 
         // The rest of the arguments are passed with with flags
@@ -248,6 +266,13 @@ static CLI_Options parseArgs(int argc, char** argv) {
         else if (a == "--sunset")     opt.useSunset = true;
         else if (a == "--no-sunset")  opt.useSunset = false;
         else if (a == "--dark-boids") opt.darkBoids = true;
+        else if (a == "--bench") opt.bench = true;
+        else if (auto v = eat("--frames"); !v.empty()) parseStrictNonNegInt(v, opt.frames);
+        else if (auto v = eat("--trials"); !v.empty()) parseStrictNonNegInt(v, opt.trials);
+        else if (auto v = eat("--threads"); !v.empty()) parseStrictNonNegInt(v, opt.threads);
+        else if (auto v = eat("--seed"); !v.empty()) { int s; if (parseStrictNonNegInt(v, s)) opt.seed = (unsigned)s; }
+        else if (auto v = eat("--csv"); !v.empty()) opt.csvPath = v;
+        else if (auto v = eat("--mode"); !v.empty()) opt.mode = v; // serial|parallel|both
         // Print help message
         else if (a == "-?" || a == "--help") {
             std::cout << "Uso: flocking [num_boids] [opciones]\n";
@@ -860,11 +885,140 @@ public:
 };
 
 // ==========================
+// Benchmark
+// ==========================
+
+#include <fstream>
+#include <random>
+
+// Ejecuta frames de update y devuelve tiempo total en microsegundos
+static long long run_simulation_once(bool parallel, int frames, int width, int height, int numBoids, unsigned seed) {
+    // Semilla fija por corrida para reproducibilidad
+    std::srand(seed);
+
+    FlockingSystem flock(width, height);
+    flock.initializeBirds(numBoids);
+
+    // dt fijo para reducir varianza (no dependas del reloj real)
+    const float dt = 1.0f / 60.0f;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int f = 0; f < frames; ++f) {
+        if (parallel) flock.updateParallel();
+        else          flock.updateSerial();
+        // No es necesario mover gato ni render, para medir cómputo puro
+        // Si quisieras medir “end-to-end” con render, init SDL y dibuja aquí.
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+}
+
+static void run_benchmark(const CLI_Options& opt) {
+    // Config OMP
+    if (opt.threads > 0) omp_set_num_threads(opt.threads);
+    const int p = (opt.threads > 0) ? opt.threads : omp_get_max_threads();
+
+    const int W = (opt.width  > 0 ? opt.width  : 1280);
+    const int H = (opt.height > 0 ? opt.height : 720);
+
+    // CSV
+    std::ofstream csv;
+    if (!opt.csvPath.empty()) {
+        csv.open(opt.csvPath);
+    }
+    auto& out = opt.csvPath.empty() ? std::cout : csv;
+
+    out << "mode,boids,frames,trials,threads,seed,trial_idx,usec\n";
+
+    std::vector<long long> serial_us;
+    std::vector<long long> parallel_us;
+
+    // Estimate ETA
+    const int sampleFrames = 60;
+    auto ser_us = (opt.mode != "parallel") ? run_simulation_once(false, sampleFrames, W, H, opt.numBoids, opt.seed) : 0;
+    auto par_us = (opt.mode != "serial")   ? run_simulation_once(true,  sampleFrames, W, H, opt.numBoids, opt.seed) : 0;
+
+    double tpf_ser = (opt.mode != "parallel") ? (double)ser_us / sampleFrames : 0.0;
+    double tpf_par = (opt.mode != "serial")   ? (double)par_us / sampleFrames : 0.0;
+    double eta_sec = (opt.trials * opt.frames * (tpf_ser + tpf_par)) / 1e6;
+
+    std::cerr << "[bench] ETA aproximada: ~" << (long long)std::llround(eta_sec) << " s "
+            << "(mode=" << opt.mode
+            << ", boids=" << opt.numBoids
+            << ", trials=" << opt.trials
+            << ", frames=" << opt.frames
+            << ", threads=" << p << ")\n";
+
+
+    if (opt.mode != "parallel") {
+        // SERIAL
+        serial_us.reserve(opt.trials);
+        for (int t = 0; t < opt.trials; ++t) {
+            long long us = run_simulation_once(false, opt.frames, W, H, opt.numBoids, opt.seed + t);
+            serial_us.push_back(us);
+            out << "serial," << opt.numBoids << "," << opt.frames << "," << opt.trials << ","
+                << p << "," << (opt.seed + t) << "," << (t+1) << "," << us << "\n";
+        }
+    }
+
+    if (opt.mode != "serial") {
+        // PARALELO
+        parallel_us.reserve(opt.trials);
+        for (int t = 0; t < opt.trials; ++t) {
+            long long us = run_simulation_once(true, opt.frames, W, H, opt.numBoids, opt.seed + t);
+            parallel_us.push_back(us);
+            out << "parallel," << opt.numBoids << "," << opt.frames << "," << opt.trials << ","
+                << p << "," << (opt.seed + t) << "," << (t+1) << "," << us << "\n";
+        }
+    }
+
+    auto stats = [](const std::vector<long long>& v) {
+        long double sum = 0.0L; for (auto x : v) sum += x;
+        long double mean = sum / v.size();
+        long double var = 0.0L; for (auto x : v) { long double d = x - mean; var += d*d; }
+        var /= (v.size() > 1 ? (v.size() - 1) : 1);
+        long double sd = std::sqrt(var);
+        return std::pair<long double,long double>(mean, sd);
+    };
+
+    auto [mean_ser, sd_ser] = stats(serial_us);
+    auto [mean_par, sd_par] = stats(parallel_us);
+
+    long double speedup = mean_ser / mean_par;
+    long double efficiency = speedup / p;
+
+    out << "# summary\n";
+    out << "# threads=" << p
+        << " mean_serial_us=" << (long long)mean_ser << " sd_serial_us=" << (long long)sd_ser
+        << " mean_parallel_us=" << (long long)mean_par << " sd_parallel_us=" << (long long)sd_par
+        << " speedup=" << (double)speedup << " efficiency=" << (double)efficiency << "\n";
+
+    if (&out == &std::cout) std::cout << std::flush;
+
+    if (!opt.csvPath.empty()) {
+        std::cerr << "[bench] Resultados escritos en: " << opt.csvPath << "\n";
+    }
+
+}
+
+
+
+
+// ==========================
 // MAIN
 // ==========================
 int main(int argc, char** argv) {
 
     CLI_Options opt = parseArgs(argc, argv);
+
+    if (opt.bench) {
+        if (opt.width <= 0)  opt.width  = 1280;
+        if (opt.height <= 0) opt.height = 720;
+        if (opt.trials < 1)  opt.trials = 10;
+        if (opt.frames < 1)  opt.frames = 600;
+        run_benchmark(opt);
+        return 0;
+    }
 
     if (opt.width <= 0)  opt.width  = askInt("Ancho de la ventana", 640, 1280);
     if (opt.height <= 0) opt.height = askInt("Alto de la ventana",  480, 720);
